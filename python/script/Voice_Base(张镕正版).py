@@ -14,6 +14,14 @@ import noisereduce as nr
 import os
 import librosa 
 import librosa.display
+import torch
+from torch import nn
+import torchvision
+from torch.autograd import Variable
+from torchvision import transforms
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
+
 #计算曼哈顿距离的匿名函数
 manhattan_distance=lambda x,y:np.sum(np.abs(x-y))
 #引入第三方dtw包直接计算
@@ -337,7 +345,7 @@ def findSegment(express):
                 voiceseg[i] = seg
         return voiceseg
 
-def vad_specEN():
+def vad_specEN(AU,wnd,inc,fs,NIS,thr1,thr2,data):
         import matplotlib.pyplot as plt
         from scipy.signal import medfilt
         x = AU.enframe(data, wnd, inc)
@@ -464,138 +472,313 @@ def noise_reduce(voice_data,noise_data=[],sample_rate=16000):
     elif len(voice_data)!=0 and len(noise_data)!=0:
         reduced_voice_data=nr.reduce_noise(y=voice_data,y_noise=noise_data,sr=sample_rate)
     return reduced_voice_data
+
+
+def listdir(path):  # 传入存储的list
+    list_name=[]
+    for file in os.listdir(path):
+        file_path = os.path.join(path, file)
+        if not os.path.isdir(file_path):
+            list_name.append(file_path)
+    return list_name
+#获取wav数据及其标签组成的数据
+#方便统一快速地制作训练集和测试集
+#i:数据集起点下标，如do_i.wav
+#j:数据集终点下标，如do_j.wav
+def get_wav_data(i,j):
+
+    #负责记录整个数据集的矩阵
+    whole_data=[]
+    wave_data_class=["do","re","mi","fa","so"]
+    index=0
+    #c:class
+    for c in wave_data_class:
+        #打开当前语音种类对应的文件夹，预备数据
+        path="C:/Users/gnyy/Desktop/Underwater_Superlimb-master/wav_data/"+c
+        #获取语音数据列表
+        dir_list=listdir(path=path)
+        #遍历语音数据，挑选指定下标范围的数据
+        for n in range(len(dir_list)):
+            if n>=i-1 and n<j:
+                data,fs,n_bits,AU=get_wav_time_data(dir_list[n])
+                IS = 0.25
+                wlen = 200
+                inc = 200
+                N = len(data)
+                wnd = np.hamming(wlen)
+                time = [i / fs for i in range(N)]
+                overlap = wlen - inc
+                NIS = int((IS * fs - wlen) // inc + 1)
+                thr1 = 0.99
+                thr2 = 0.96
+                #端点检测，提取音频段
+                voiceseg, vsl, SF, NF, Enm =vad_specEN(AU=AU,wnd=wnd,inc=inc,fs=fs,NIS=NIS,thr1=thr1,thr2=thr2,data=data);
+                fn = len(SF)
+                frameTime = AU.FrameTimeC(fn, wlen, inc, fs)
+                #遍历选定音频下的所有声音，计算平均模板
+                for m in range(vsl):
+                    if m>=1:
+                        data_seg_1 = data[ (int)(frameTime[voiceseg[m]['start']] * fs) : (int)(frameTime[voiceseg[m]['end']] *fs) ]
+                        tempmfcc = librosa.feature.mfcc(y=data_seg_1, sr=fs)
+                        r_,c_=tempmfcc.shape
+                        if c_>=15 and c_<=20:
+                            if(c_<20):
+                                t=np.zeros((20,20-c_))
+                                tempmfcc=np.column_stack((tempmfcc,t))
+                            tempmfcc=np.transpose(tempmfcc)
+                            #获取转置的mfcc矩阵，每行为一个时序的20个频段的数据分布
+                            temp=[]
+                            temp.append(tempmfcc)
+                            temp.append(index)
+                            whole_data.append(temp)
+        index=index+1
+    return whole_data
+
+#获取语音时序数据
+def get_wav_time_data(path):
+    AU = Voice_Base(path=path)
+    data_two, fs, n_bits= AU.audioread()
+    data= data_two[:,1]
+    #去噪
+    data=noise_reduce(voice_data=data)
+    #数据归一化
+    data=data-np.mean(data)
+    data /= np.max(data)
+
+    return data,fs,n_bits,AU
+
+#定义自己的数据读取方式
+class MyDataset(Dataset):
+    def __init__(self,i,j,transform=None):
+        super().__init__()
+        self.wav_data=get_wav_data(i,j)
+        self.i=i
+        self.j=j
+        self.transform=transform
+    def __getitem__(self, index):
+        data=self.wav_data[index][0]
+        label=self.wav_data[index][1]
+        label=np.array(label)
+        label=torch.from_numpy(label)
+        if self.transform is not None:
+            data=self.transform(data)
+        return data,label
+    def __len__(self):
+        return len(self.wav_data)
+
+##定义RNN模型
+class RNN(nn.Module):
+    def __init__(self):
+        super(RNN,self).__init__()
+        self.rnn=nn.LSTM(
+            #语音段的时序数
+            input_size=INPUT_SIZE,
+            #隐藏层
+            hidden_size=64,
+            #呦两层 RNN layers
+            num_layers=2,
+            #input & output 会是以batch size 为第一维度的特征集 e.g.(batch,time_step,input_size)
+            batch_first=True,
+        )
+        #输出层
+        self.out=nn.Linear(64,5)
+    def forward(self,x):
+        h0 = torch.zeros(self.rnn.num_layers, x.size(0), self.rnn.hidden_size)
+        c0 = torch.zeros(self.rnn.num_layers, x.size(0), self.rnn.hidden_size)
+        r_out,(h_n,h_c)=self.rnn(x,(h0,c0))
+        out=self.out(r_out[:,-1,:])
+        return out
+##网络方法
+transform=transforms.ToTensor()
+traindatasets=MyDataset(1,4,transform)
+data_loader=DataLoader(traindatasets,batch_size=1,shuffle=True,num_workers=0)
+#训练整批数据多少次
+EPOCH=8
+BATCH_SIZE=64
+#时间长度
+TIME_STEP=20
+#滤波器位数
+INPUT_SIZE=20
+#学习率
+LR=0.0005
+
+#准备测试数据
+test_data=MyDataset(5,5,transform)
+test_lodader=DataLoader(test_data,batch_size=1,shuffle=True,num_workers=0)
+rnn=RNN()
+
+#RNN 训练
+optimizer=torch.optim.Adam(rnn.parameters(),lr=LR)
+loss_func=nn.CrossEntropyLoss()
+#训练
+for epoch in range (EPOCH):
+    for step,(x,b_y) in  enumerate(data_loader):
+        b_x=x.view(-1,20,20)
+        b_x=b_x.to(torch.float32)
+        output=rnn(b_x)
+        b_y=b_y.to(torch.long)
+        loss=loss_func(output,b_y)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        if step%10==0:
+           print ('Epoch [%d/%d], Step [%d/%d], Loss: %.4f' %(epoch+1, EPOCH, step+1, traindatasets.__len__(), loss.item()))
+#测试模型
+correct=0
+total=0
+for data,labels in test_lodader:
+    data=data.view(-1,20,20)
+    data=data.to(torch.float32)
+    labels=labels.to(torch.long)
+    output=rnn(data)
+    _,predicted=torch.max(output.data,1)
+    total+=labels.size(0)
+    correct+=(predicted==labels).sum()
+print('Test Accuracy of the model: %d %%' % (100 * correct / total))
+
+#计算时序数据
+
+
 ##############################
 # Test the Class Methods
 #获取待比较的语音段
-AU = Voice_Base(path='C:\\Users\\gnyy\\Desktop\\Underwater_Superlimb-master\\python\\script\\single_pitch\\so_4.wav')
-template="C:\\Users\\gnyy\\Desktop\\Underwater_Superlimb-master\\template\\1.txt"
-# NU=Voice_Base(path='C:\\Users\\gnyy\\Desktop\\Underwater_Superlimb-master\\wav_voice_1213\\wav_single_pitch_1215\\test_noise_sample.wav')
-#模板文件的路径，以txt形式记录，txt第一行为矩阵的行数，txt第二行为矩阵的列数，后续每一行为一个数字数据。（注：存储的矩阵为原始mcff矩阵的转置矩阵）
-File_Path=[];
-File_Path.append('C:\\Users\\gnyy\\Desktop\\Underwater_Superlimb-master\\template\\1.txt')
-File_Path.append('C:\\Users\\gnyy\\Desktop\\Underwater_Superlimb-master\\template\\2.txt')
-File_Path.append('C:\\Users\\gnyy\\Desktop\\Underwater_Superlimb-master\\template\\3.txt')
-File_Path.append('C:\\Users\\gnyy\\Desktop\\Underwater_Superlimb-master\\template\\4.txt')
-File_Path.append('C:\\Users\\gnyy\\Desktop\\Underwater_Superlimb-master\\template\\5.txt')
+#AU = Voice_Base(path='C:\\Users\\gnyy\\Desktop\\Underwater_Superlimb-master\\python\\script\\single_pitch\\so_4.wav')
+# template="C:\\Users\\gnyy\\Desktop\\Underwater_Superlimb-master\\template\\5.txt"
+# # NU=Voice_Base(path='C:\\Users\\gnyy\\Desktop\\Underwater_Superlimb-master\\wav_voice_1213\\wav_single_pitch_1215\\test_noise_sample.wav')
+# #模板文件的路径，以txt形式记录，txt第一行为矩阵的行数，txt第二行为矩阵的列数，后续每一行为一个数字数据。（注：存储的矩阵为原始mcff矩阵的转置矩阵）
+# File_Path=[];
+# File_Path.append('C:\\Users\\gnyy\\Desktop\\Underwater_Superlimb-master\\template\\1.txt')
+# File_Path.append('C:\\Users\\gnyy\\Desktop\\Underwater_Superlimb-master\\template\\2.txt')
+# File_Path.append('C:\\Users\\gnyy\\Desktop\\Underwater_Superlimb-master\\template\\3.txt')
+# File_Path.append('C:\\Users\\gnyy\\Desktop\\Underwater_Superlimb-master\\template\\4.txt')
+# File_Path.append('C:\\Users\\gnyy\\Desktop\\Underwater_Superlimb-master\\template\\5.txt')
 
 
 
 
-#获取语音的时序数据 频率 数据深度
-data_two, fs, n_bits= AU.audioread()
-# noise_two,n_fs,noise_bits=NU.audioread()
-data= data_two[:,1]
-# noise=noise_two[:,1]
-# noise=noise[int(len(noise)/2):] 
-# data, fs, n_bits = AU.audioread()
-print(len(data))
+# #获取语音的时序数据 频率 数据深度
+# data_two, fs, n_bits= AU.audioread()
+# # noise_two,n_fs,noise_bits=NU.audioread()
+# data= data_two[:,1]
+# # noise=noise_two[:,1]
+# # noise=noise[int(len(noise)/2):] 
+# # data, fs, n_bits = AU.audioread()
+# print(len(data))
 
 
 
-#打印中间数据，测试用
-#print(tempdata)
-#数据重整为一维
+# #打印中间数据，测试用
+# #print(tempdata)
+# #数据重整为一维
+# data=noise_reduce(voice_data=data)
+# data=data-np.mean(data)
+# data /= np.max(data)
+# IS = 0.25
+# wlen = 200
+# inc = 200
+# N = len(data)
+# wnd = np.hamming(wlen)
+# time = [i / fs for i in range(N)]
+# overlap = wlen - inc
+# NIS = int((IS * fs - wlen) // inc + 1)
+# thr1 = 0.99
+# thr2 = 0.96
+# #vad_specEN(data, wnd, inc, NIS, thr1, thr2, fs, self):
 
-data=data-np.mean(data)
-data /= np.max(data)
-IS = 0.25
-wlen = 200
-inc = 200
-N = len(data)
-wnd = np.hamming(wlen)
-time = [i / fs for i in range(N)]
-overlap = wlen - inc
-NIS = int((IS * fs - wlen) // inc + 1)
-thr1 = 0.99
-thr2 = 0.96
-#vad_specEN(data, wnd, inc, NIS, thr1, thr2, fs, self):
 
 
 
-voiceseg, vsl, SF, NF, Enm =vad_specEN();
 
-fn = len(SF)
-frameTime = AU.FrameTimeC(fn, wlen, inc, fs)
-plt.subplot(2, 1, 1)
-plt.plot(time, data)
-plt.subplot(2, 1, 2)
-plt.plot(frameTime, Enm)
 
-#基准模板矩阵
-basemfccs=[];
-#遍历基准模板文件，获取基准模板数组
-for i in range (5):
-    file_path=File_Path[i];
-    basemfccs.append(getBaseMcff(file_path))
+# voiceseg, vsl, SF, NF, Enm =vad_specEN();
 
-#向文件中写入模板文件数据
-# file_path=template
-# #提取某个数据作为初始模板
-# data_seg_1 = data[ (int)(frameTime[voiceseg[6]['start']] * fs) : (int)(frameTime[voiceseg[6]['end']] *fs) ]
-# basemfcc = librosa.feature.mfcc(data_seg_1, fs)
+# fn = len(SF)
+# frameTime = AU.FrameTimeC(fn, wlen, inc, fs)
+# plt.subplot(2, 1, 1)
+# plt.plot(time, data)
+# plt.subplot(2, 1, 2)
+# plt.plot(frameTime, Enm)
 
-# #遍历文件下的所有声音，计算平均模板
+# #基准模板矩阵
+# basemfccs=[];
+# #遍历基准模板文件，获取基准模板数组
+# for i in range (5):
+#     file_path=File_Path[i];
+#     basemfccs.append(getBaseMcff(file_path))
+
+# #向文件中写入模板文件数据
+# # file_path=template
+# # #提取某个数据作为初始模板
+# # data_seg_1 = data[ (int)(frameTime[voiceseg[6]['start']] * fs) : (int)(frameTime[voiceseg[6]['end']] *fs) ]
+# # basemfcc = librosa.feature.mfcc(data_seg_1, fs)
+
+# # #遍历文件下的所有声音，计算平均模板
+# # for i in range(vsl):
+# #     if i>=1:
+# #         data_seg_1 = data[ (int)(frameTime[voiceseg[i]['start']] * fs) : (int)(frameTime[voiceseg[i]['end']] *fs) ]
+# #         tempmfcc = librosa.feature.mfcc(data_seg_1, fs)
+# #         d,cost_matrix,acc_cost_matrix,path=dtw(np.transpose(basemfcc),np.transpose(tempmfcc),dist=manhattan_distance);
+# #         r,c=tempmfcc.shape
+# #         if c>=15:
+# #             r,c=basemfcc.shape
+# #             basemfcc=np.transpose(basemfcc)
+# #             tempmfcc=np.transpose(tempmfcc)
+# #             for j in range (c):
+# #                 basemfcc[j]=(basemfcc[path[0][j]]+tempmfcc[path[1][j]])/2
+# #             basemfcc=np.transpose(basemfcc)
+
+# # with open(file_path,mode='w',encoding='utf-8') as file_obj:
+# #      r,c=basemfcc.shape;
+# #      file_obj.write(str(r));
+# #      file_obj.write('\n')
+# #      file_obj.write(str(c));
+# #      file_obj.write('\n')
+# #      for i in range (r):
+# #          for j in range (c):
+# #              file_obj.write(str(basemfcc[i][j]));
+# #              file_obj.write('\n')
+
+
+
+# index=[];
+# dis=[]
 # for i in range(vsl):
-#     if i>=1:
-#         data_seg_1 = data[ (int)(frameTime[voiceseg[i]['start']] * fs) : (int)(frameTime[voiceseg[i]['end']] *fs) ]
-#         tempmfcc = librosa.feature.mfcc(data_seg_1, fs)
-#         d,cost_matrix,acc_cost_matrix,path=dtw(np.transpose(basemfcc),np.transpose(tempmfcc),dist=manhattan_distance);
-#         r,c=tempmfcc.shape
-#         if c>=15:
-#             r,c=basemfcc.shape
-#             basemfcc=np.transpose(basemfcc)
-#             tempmfcc=np.transpose(tempmfcc)
-#             for j in range (c):
-#                 basemfcc[j]=(basemfcc[path[0][j]]+tempmfcc[path[1][j]])/2
-#             basemfcc=np.transpose(basemfcc)
+#     plt.subplot(2, 1, 1)
+#     plt.plot(frameTime[voiceseg[i]['start']], 0, '.k')
+#     plt.plot(frameTime[voiceseg[i]['end']], 0, 'or')
+#     plt.legend(['signal', 'start', 'end'])
+#     plt.subplot(2, 1, 2)
+#     plt.plot(frameTime[voiceseg[i]['start']], 0, '.k')
+#     plt.plot(frameTime[voiceseg[i]['end']], 0, 'or')
+#     plt.legend(['熵谱', 'start', 'end'])
+#     plt.figure(figsize=(20,10))
+#     data_seg_1 = data[ (int)(frameTime[voiceseg[i]['start']] * fs) : (int)(frameTime[voiceseg[i]['end']] *fs) ]
+#     time_seg_1 = np.linspace(frameTime[voiceseg[i]['start']],frameTime[voiceseg[i]['end']], len(data_seg_1))
+#     # plt.plot(time_seg_1, data_seg_1)
+#     mfccs = librosa.feature.mfcc(data_seg_1, fs)
+#     #标定最短距离
+#     mind=99999;
+#     #标定类别
+#     minindex=-1;
+#     #遍历所有模板
+#     for i in range (5):
+#         d,cost_matrix,acc_cost_matrix,path=dtw(np.transpose(mfccs),basemfccs[i],dist=manhattan_distance);
+#         print("当前信号与模板类别{}的差值为:".format(i+1),"{}".format(d));
+#         if d<mind:
+#             mind=d;
+#             minindex=i;
+#     ##print("当前信号与模板类别{}差值最小".format(minindex+1),"差值为{}".format(mind));
+#     index.append(minindex+1)
+#     dis.append(mind)
+#     plt.close()
+# print(index)
+# print(dis)
+# plt.show()
 
-# with open(file_path,mode='w',encoding='utf-8') as file_obj:
-#      r,c=basemfcc.shape;
-#      file_obj.write(str(r));
-#      file_obj.write('\n')
-#      file_obj.write(str(c));
-#      file_obj.write('\n')
-#      for i in range (r):
-#          for j in range (c):
-#              file_obj.write(str(basemfcc[i][j]));
-#              file_obj.write('\n')
 
 
 
-index=[];
-dis=[]
-for i in range(vsl):
-    plt.subplot(2, 1, 1)
-    plt.plot(frameTime[voiceseg[i]['start']], 0, '.k')
-    plt.plot(frameTime[voiceseg[i]['end']], 0, 'or')
-    plt.legend(['signal', 'start', 'end'])
-    plt.subplot(2, 1, 2)
-    plt.plot(frameTime[voiceseg[i]['start']], 0, '.k')
-    plt.plot(frameTime[voiceseg[i]['end']], 0, 'or')
-    plt.legend(['熵谱', 'start', 'end'])
-    plt.figure(figsize=(20,10))
-    data_seg_1 = data[ (int)(frameTime[voiceseg[i]['start']] * fs) : (int)(frameTime[voiceseg[i]['end']] *fs) ]
-    time_seg_1 = np.linspace(frameTime[voiceseg[i]['start']],frameTime[voiceseg[i]['end']], len(data_seg_1))
-    # plt.plot(time_seg_1, data_seg_1)
-    mfccs = librosa.feature.mfcc(data_seg_1, fs)
-    #标定最短距离
-    mind=99999;
-    #标定类别
-    minindex=-1;
-    #遍历所有模板
-    for i in range (5):
-        d,cost_matrix,acc_cost_matrix,path=dtw(np.transpose(mfccs),basemfccs[i],dist=manhattan_distance);
-        print("当前信号与模板类别{}的差值为:".format(i+1),"{}".format(d));
-        if d<mind:
-            mind=d;
-            minindex=i;
-    ##print("当前信号与模板类别{}差值最小".format(minindex+1),"差值为{}".format(mind));
-    index.append(minindex+1)
-    dis.append(mind)
-    plt.close()
-print(index)
-print(dis)
-plt.show()
+
 # plt.savefig('images/TwoThr.png')
 ####
 
