@@ -16,12 +16,10 @@ import librosa
 import librosa.display
 import torch
 from torch import nn
-import torchvision
-from torch.autograd import Variable
 from torchvision import transforms
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
-
+import time
 #计算曼哈顿距离的匿名函数
 manhattan_distance=lambda x,y:np.sum(np.abs(x-y))
 #引入第三方dtw包直接计算
@@ -317,7 +315,7 @@ class Voice_Base(object):
 
 def findSegment(express):
         #"""
-        #分割成語音段
+        #分割成语音段
         #:param express:
         #:return:
         #"""
@@ -481,6 +479,22 @@ def listdir(path):  # 传入存储的list
         if not os.path.isdir(file_path):
             list_name.append(file_path)
     return list_name
+
+
+def create_wav_file(path,data,fs):
+
+    FORMAT = pyaudio.paInt16
+    CHANNELS = 2
+    RATE = fs
+
+    p = pyaudio.PyAudio()
+    wf = wave.open(path, 'wb')
+    wf.setnchannels(CHANNELS)
+    wf.setsampwidth(p.get_sample_size(FORMAT))
+    wf.setframerate(RATE)
+    wf.writeframes(b''.join(data))
+    wf.close()
+
 #获取wav数据及其标签组成的数据
 #方便统一快速地制作训练集和测试集
 #i:数据集起点下标，如do_i.wav
@@ -515,22 +529,38 @@ def get_wav_data(i,j):
                 voiceseg, vsl, SF, NF, Enm =vad_specEN(AU=AU,wnd=wnd,inc=inc,fs=fs,NIS=NIS,thr1=thr1,thr2=thr2,data=data);
                 fn = len(SF)
                 frameTime = AU.FrameTimeC(fn, wlen, inc, fs)
-                #遍历选定音频下的所有声音，计算平均模板
+                #遍历选定音频下的所有声音，计算mfcc特征矩阵
                 for m in range(vsl):
                     if m>=1:
                         data_seg_1 = data[ (int)(frameTime[voiceseg[m]['start']] * fs) : (int)(frameTime[voiceseg[m]['end']] *fs) ]
+                        #计算mfcc矩阵
                         tempmfcc = librosa.feature.mfcc(y=data_seg_1, sr=fs)
+                        #将特征压入数据集中去
                         r_,c_=tempmfcc.shape
                         if c_>=15 and c_<=20:
-                            if(c_<20):
-                                t=np.zeros((20,20-c_))
-                                tempmfcc=np.column_stack((tempmfcc,t))
-                            tempmfcc=np.transpose(tempmfcc)
-                            #获取转置的mfcc矩阵，每行为一个时序的20个频段的数据分布
-                            temp=[]
-                            temp.append(tempmfcc)
-                            temp.append(index)
-                            whole_data.append(temp)
+                            #vggish只接受.wav格式的数据输入，首先将我们获取到的语音段作为.wav数据临时保存到指定文件夹中去
+                            #create_wav_file("C:/Users/gnyy/Desktop/Underwater_Superlimb-master/wav_data/wav/wav.wav",data_seg_1,fs)
+                            #a = AudioFileClip(dir_list[n])  #读入文件
+                            #audio1 = a.subclip(frameTime[voiceseg[m]['start']] ,frameTime[voiceseg[m]['end']] )   #剪切
+                            #audiocct = concatenate_audioclips([audio1])
+                            #audiocct .write_audiofile('C:/Users/gnyy/Desktop/Underwater_Superlimb-master/wav_data/wav/wav.wav') #输出
+                            try:
+                                #tempm=model.forward('C:/Users/gnyy/Desktop/Underwater_Superlimb-master/wav_data/wav/wav.wav')
+                                #print(tempm)
+                                if(c_<20):
+                                    t=np.zeros((20,20-c_))
+                                    tempmfcc=np.column_stack((tempmfcc,t))
+                                tempmfcc=np.transpose(tempmfcc)
+                                #获取转置的mfcc矩阵，每行为一个时序的20个频段的数据分布
+                                temp=[]
+                                temp.append(tempmfcc)
+                                #tempm=tempm.cpu()
+                                #temp.append(tempm)
+                                temp.append(index)
+                                whole_data.append(temp)
+                            except(RuntimeError):
+                                print("语音段无效")
+                            
         index=index+1
     return whole_data
 
@@ -575,7 +605,7 @@ class RNN(nn.Module):
             input_size=INPUT_SIZE,
             #隐藏层
             hidden_size=64,
-            #呦两层 RNN layers
+            #两层 RNN layers
             num_layers=2,
             #input & output 会是以batch size 为第一维度的特征集 e.g.(batch,time_step,input_size)
             batch_first=True,
@@ -588,17 +618,24 @@ class RNN(nn.Module):
         r_out,(h_n,h_c)=self.rnn(x,(h0,c0))
         out=self.out(r_out[:,-1,:])
         return out
-##网络方法
+##网络方法(RNN)
+
+model=torch.hub.load('harritaylor/torchvggish', 'vggish')
+model.eval()
+
+
 transform=transforms.ToTensor()
 traindatasets=MyDataset(1,4,transform)
 data_loader=DataLoader(traindatasets,batch_size=1,shuffle=True,num_workers=0)
 #训练整批数据多少次
-EPOCH=8
+EPOCH=10
 BATCH_SIZE=64
 #时间长度
 TIME_STEP=20
+#TIME_STEP=16
 #滤波器位数
 INPUT_SIZE=20
+#INPUT_SIZE=8
 #学习率
 LR=0.0005
 
@@ -619,7 +656,7 @@ for epoch in range (EPOCH):
         b_y=b_y.to(torch.long)
         loss=loss_func(output,b_y)
         optimizer.zero_grad()
-        loss.backward()
+        loss.backward(retain_graph=True)
         optimizer.step()
         if step%10==0:
            print ('Epoch [%d/%d], Step [%d/%d], Loss: %.4f' %(epoch+1, EPOCH, step+1, traindatasets.__len__(), loss.item()))
@@ -636,9 +673,9 @@ for data,labels in test_lodader:
     correct+=(predicted==labels).sum()
 print('Test Accuracy of the model: %d %%' % (100 * correct / total))
 
+torch.save(rnn, 'rnn.pth')
+
 #计算时序数据
-
-
 ##############################
 # Test the Class Methods
 #获取待比较的语音段
