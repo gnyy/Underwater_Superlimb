@@ -625,10 +625,10 @@ model.eval()
 
 
 transform=transforms.ToTensor()
-traindatasets=MyDataset(1,4,transform)
+traindatasets=MyDataset(1,13,transform)
 data_loader=DataLoader(traindatasets,batch_size=1,shuffle=True,num_workers=0)
 #训练整批数据多少次
-EPOCH=10
+EPOCH=8
 BATCH_SIZE=64
 #时间长度
 TIME_STEP=20
@@ -640,7 +640,7 @@ INPUT_SIZE=20
 LR=0.0005
 
 #准备测试数据
-test_data=MyDataset(5,5,transform)
+test_data=MyDataset(14,15,transform)
 test_lodader=DataLoader(test_data,batch_size=1,shuffle=True,num_workers=0)
 rnn=RNN()
 

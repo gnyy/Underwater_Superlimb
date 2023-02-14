@@ -12,7 +12,10 @@ import time
 from torchvision import transforms
 import struct 
 import copy
-
+import sys
+from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 class Voice_Base(object):
     
@@ -355,7 +358,6 @@ def FrameTimeC(frameNum, frameLen, inc, fs):
         return ((ll - 1) * inc + frameLen / 2) / fs
 
 
-        
 def vad_specEN(wnd,inc,fs,NIS,thr1,thr2,data,AU=None):
         import matplotlib.pyplot as plt
         from scipy.signal import medfilt
@@ -464,6 +466,7 @@ def vad_revr(dst1, T1, T2):
         vsl = len(voiceseg.keys())
         return voiceseg, vsl, SF, NF
 
+
 def getBaseMcff(file_path):
     with open(file_path,mode='r',encoding='utf-8') as file_obj:
         r=int(file_obj.readline());
@@ -477,10 +480,11 @@ def getBaseMcff(file_path):
         file_obj.close();
     return np.transpose(basemfcc)
 
+
 def noise_reduce(voice_data,noise_data=[],sample_rate=16000):
     reduced_voice_data=[]
     if len(voice_data)==0:
-        print("语音数据为空")
+        print("collect noise")
     elif len(voice_data)!=0 and len(noise_data)==0:
         reduced_voice_data=nr.reduce_noise(y=voice_data,sr=sample_rate)
     elif len(voice_data)!=0 and len(noise_data)!=0:
@@ -523,95 +527,220 @@ class RNN(nn.Module):
         return out
 
 
+##回调函数中需要开启的线程
+def Thread_process_voise(in_data):
 
-##获取实时语音数据流
-#参数设置
-CHUNK = 1024
-FORMAT = pyaudio.paInt16
-CHANNELS = 2
-RATE = 16000
-
-#打开录音流
-p = pyaudio.PyAudio()
-stream =p.open(format=FORMAT,
-               channels=CHANNELS,
-               rate=RATE,
-               input=True,
-               frames_per_buffer=CHUNK)
-low_audio_flag = 0
-detect_count = 0
-data=[]
-
-transform=transforms.ToTensor()
-net = torch.load('C:/Users/gnyy/Desktop/Underwater_Superlimb-master/python/script/rnn.pth')
-index=0
-
-while True:
-    index+=1
-    if index>=10000:
-        break
-    detect_count+=1
-    stream_data=stream.read(CHUNK)
-    #合并两个数据
-    stream_data=struct.unpack('<2048h',bytes(stream_data)) 
-    #数据合并
-    data=data+(list)(stream_data)
-
-    #临时数据，处理用
-    tempdata=copy.copy(data)
-
+    max=-999
+    index=-1
+    data=copy.copy(in_data)
     #去噪
-    tempdata=noise_reduce(voice_data=tempdata)
+    data=noise_reduce(voice_data=data)
     #数据归一化
-    tempdata=tempdata-np.mean(tempdata)
-    tempdata /= np.max(tempdata)
-    
-    
-    # plt.show()
-
+    data=data-np.mean(data)
+    data /= np.max(data)
+    N=len(data)
+    # ###取后五秒最新数据
+    global Voise_Sequence_index
+    # if(N>16000*5):
+    #     data=data[-16000*5:]
     IS = 0.25
     wlen = 200
     inc = 200
     fs=RATE
-    N = len(tempdata)
     wnd = np.hamming(wlen)
-    time = [i / fs for i in range(N)]
-    overlap = wlen - inc
     NIS = int((IS * fs - wlen) // inc + 1)
     thr1 = 0.99
     thr2 = 0.96
     #端点检测，提取音频段
+
+    ########
     try:
-        
-        voiceseg, vsl, SF, NF, Enm =vad_specEN(wnd=wnd,inc=inc,fs=fs,NIS=NIS,thr1=thr1,thr2=thr2,data=tempdata);
+        voiceseg, vsl, SF, NF, Enm =vad_specEN(wnd=wnd,inc=inc,fs=fs,NIS=NIS,thr1=thr1,thr2=thr2,data=data);
         fn = len(SF)
         frameTime =FrameTimeC(fn, wlen, inc, fs)
         for m in range(vsl):
             if m>=1:
-                print("开始了")
-                data_seg_1 = tempdata[ (int)(frameTime[voiceseg[m]['start']] * fs) : (int)(frameTime[voiceseg[m]['end']] *fs) ]
+                data_seg_1 = data[ (int)(frameTime[voiceseg[m]['start']] * fs) : (int)(frameTime[voiceseg[m]['end']] *fs) ]
                 #计算mfcc矩阵
-                tempmfcc = librosa.feature.mfcc(y=data_seg_1, sr=fs)
+                mfcc = librosa.feature.mfcc(y=data_seg_1, sr=fs)
                 #将特征压入数据集中去
-                r_,c_=tempmfcc.shape
-                if c_>=15 and c_<=20:
+                r_,c_=mfcc.shape
+                if c_>=7 and c_<=20:
                     if(c_<20):
                         t=np.zeros((20,20-c_))
-                        tempmfcc=np.column_stack((tempmfcc,t))
-                    tempmfcc=np.transpose(tempmfcc)
+                        mfcc=np.column_stack((mfcc,t))
+                    mfcc=np.transpose(mfcc)
                     #获取转置的mfcc矩阵，每行为一个时序的20个频段的数据分布
-                    tempmfcc=transform(tempmfcc).to(torch.float32)
-                    x=net(tempmfcc).detach().numpy()[0][0]
-                    if x>3:
-                        break
-            
-       
+                    mfcc=transform(mfcc).to(torch.float32)
+                    #获取网络给出的类型返回
+                    x=net(mfcc).detach().numpy()[0]
+
+                    #获取可信度最大的值和其对应的下标
+                    for i in range (5):
+                        if x[i]>max:
+                            max=x[i]
+                            index=i
+                    #可信度大于0就更新Voise_Sequence数组
+                    if(max>0):
+                        Voise_Sequence[m-1]=Voise_Class[index]+' confidence:'+str(max)
+                    
+                    #更新Voise_Sequence_index
+                    if(m>Voise_Sequence_index):
+                        Voise_Sequence_index=m
     except(IndexError):
         xxxxx=0
-      
+
+
+def updata_whole_data(data):
+    dataList.append(copy.copy(data))
+
+
+##pyaudio录制语音用的回调函数
+def myCallback(
+    in_data,      # 如果input=True，in_data就是录制的数据，否则为None
+    frame_count,  # 帧的数量，表示本次回调要读取几帧的数据
+    time_info,    # 一个包含时间信息的dict，略
+    status_flags  #标记位
+):
+    pool.submit(updata_whole_data,in_data)
+    stream_data=in_data
+    stream_data=struct.unpack('<1024h',bytes(stream_data)) 
+    global data
+    global len_of_last_process_data
+    global dis_of_process_data
+    #数据合并
+    data=data+(list)(stream_data)
+    #前一秒不做处理，用作收集降噪数据
+    if len(data)<20000:
+        print("收集噪声中")
+        return b"", pyaudio.paContinue
+    
+    #临时数据，处理用
+    #不是每次都检查数据
+    if len(data)-len_of_last_process_data>dis_of_process_data :      
+        #提交线程处理最新的数据
+        pool.submit(Thread_process_voise, data)
+        #更新数据
+        len_of_last_process_data=len(data)
+    return b"", pyaudio.paContinue
+
+
+def Check_Voise_Sequence():
+    while True:
+        if Voise_Sequence_index>-1:
+            #打印信息
+            print(Voise_Sequence[0:Voise_Sequence_index-1])
+            #更新txt
+            path="C:/Users/gnyy/Desktop/Underwater_Superlimb-master/python/script/wav/Voise_Sequence/Voise_Sequence.txt"
+            file=open(path,'w')
+            for i in range (Voise_Sequence_index):
+                file.write(Voise_Sequence[i])
+                file.write('\n')
+            file.close()
+        print(Voise_Sequence_index)
+        time.sleep(1)
+        if(End_Flag==1):
+            return
+
+#######疯狂写注释摸鱼
+######啊啊啊啊难顶
+
+
+################整理一下思路，我的数据是要实时的，有一个整体的data，可以切出最新的五秒数据，
+##获取实时语音数据流
+
+
+##############参语音录制数设置
+
+#语音帧大小
+CHUNK = 1024
+#数据深度
+FORMAT = pyaudio.paInt16
+#语音通道数
+CHANNELS = 1
+#采样率
+RATE = 16000
+
+#########################前置数据设置
+#Pyaudio初始化
+p = pyaudio.PyAudio()
+
+###声音类别
+Voise_Class=['do','re','me','fa','so']
+
+###数据处理用数组
+data=[]
+
+##返回语音文件用数组
+dataList=[]
+
+##数据转换用，主要用于将数据转换至tensor
+transform=transforms.ToTensor()
+
+##网络初始化
+net = torch.load('C:/Users/gnyy/Desktop/Underwater_Superlimb-master/python/script/rnn.pth')
+
+###上次处理数据的长度，用于与当前数据的长度比较
+len_of_last_process_data=0
+
+###当数据增长到一定程度时，才对后五秒数据进行处理
+dis_of_process_data=5120
+
+
+#初始化线程池，最大线程池设置为200，够用了吧，应该
+pool = ThreadPoolExecutor(max_workers=200)
+
+#类型返回数据，下标表示第几个数据，该数组表示整个数据的类型序列，
+Voise_Sequence=[]
+for i in range(500):
+    Voise_Sequence.append('-1')
+
+##类型返回数据是冗余的，这是为了方式线程在更新数组时导致的越界问题，因此需要一个标记来标记当前有效语音段的最大数据
+Voise_Sequence_index=-1
+
+
+##语音结束标记，用于结束轮询线程
+End_Flag=0
+#打开录音流
+stream =p.open(format=FORMAT,#数据深度
+               channels=CHANNELS,#频道数
+               rate=RATE,#采样率
+               input=True,#输入流
+               frames_per_buffer=CHUNK,#设置数据帧大小
+               stream_callback=myCallback) #设置回调函数
+
+print("开始")
+
+#开启一个线程，轮询Voise_Sequence，每一秒更新一下数据
+
+
+#开始录音
+stream.start_stream()
+t1 = time.time()
+
+pool.submit(Check_Voise_Sequence)
+#用于录音是否结束，录音时长为60，time.sleep的目的时为了减少麦克风输入或者输出延迟的影响
+while time.time() - t1 < 60:
+    time.sleep(0.01)
+
+End_Flag=1
+
+
+#写文件
+wav_data = b"".join(dataList)
+with wave.open("C:/Users/gnyy/Desktop/Underwater_Superlimb-master/python/script/wav/ALL/1.wav", "wb") as wf:
+    wf.setnchannels(CHANNELS)
+    wf.setsampwidth(pyaudio.get_sample_size(FORMAT))
+    wf.setframerate(RATE)
+    wf.writeframes(wav_data)
 
 
 
+
+
+stream.stop_stream()
+stream.close()
+p.terminate()
 print("结束了")
 
 
